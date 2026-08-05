@@ -442,6 +442,34 @@ def insert_thought(content: str, embedding: list[float] | None, metadata: dict,
         return "failed"
 
 
+def purge_superseded(notes: list[dict]) -> int:
+    """Delete thoughts whose source note changed since their last import.
+
+    Thoughts are source-stamped with metadata.source_note + metadata.note_hash.
+    For every note imported this run, drop any stored thoughts carrying a
+    DIFFERENT note_hash for that source_note — i.e. chunks superseded by the
+    current version. Rows without source_note (pre-stamping imports and
+    capture_thought entries) are untouched.
+    """
+    total = 0
+    try:
+        cur = _get_conn().cursor()
+        try:
+            for note in notes:
+                cur.execute(
+                    "DELETE FROM thoughts "
+                    "WHERE metadata->>'source_note' = %s "
+                    "AND metadata->>'note_hash' != %s",
+                    (note['path'], note['_hash']),
+                )
+                total += cur.rowcount
+        finally:
+            cur.close()
+    except Exception as e:
+        print(f"  Purge failed: {e}", flush=True)
+    return total
+
+
 # ── Sync Log ─────────────────────────────────────────────────────────────────
 
 SYNC_LOG_FILE = "obsidian-sync-log.json"
@@ -718,6 +746,9 @@ def main():
                     # standard fields (date/tags); this side-car carries everything
                     # else (e.g. mood, location metadata, custom IDs, plugin data).
                     'frontmatter': _jsonify_frontmatter(note['meta']),
+                    # Source stamping: enables incremental sync + superseded-chunk purge.
+                    'source_note': note['path'],
+                    'note_hash': note['_hash'],
                 },
                 'note_path': note['path'],
                 'note_hash': note['_hash'],
@@ -853,6 +884,11 @@ def main():
         print(f"  Embed failures:     {embed_failures}")
     if insert_failures:
         print(f"  Insert failures:    {insert_failures}")
+
+    # ── Purge superseded chunks (source-stamped) ─────────────────────────────
+
+    purged = purge_superseded(filtered)
+    print(f"  Superseded chunks purged: {purged}")
 
     # ── Update sync log ──────────────────────────────────────────────────────
 
