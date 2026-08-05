@@ -51,12 +51,14 @@ DEFAULT_MIN_WORDS = 50
 WHOLE_NOTE_THRESHOLD = 500      # notes under this word count → 1 thought
 LLM_CHUNK_THRESHOLD = 1000     # sections over this → LLM distillation
 
-# Embedding model
-EMBEDDING_MODEL = "openai/text-embedding-3-small"
-EMBEDDING_DIMS = 1536
+# Embedding model (direct Gemini — self-hosted OB1)
+EMBEDDING_MODEL = "gemini-embedding-001"
+EMBEDDING_DIMS = 768
+EMBEDDING_MAX_CHARS = 1800  # gemini-embedding-001 caps at 2048 tokens
+GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
-# LLM model for chunking long sections
-LLM_MODEL = "openai/gpt-4o-mini"
+# LLM model for chunking long sections (direct Gemini)
+LLM_MODEL = "gemini-2.5-flash"
 
 # API retry settings
 MAX_RETRIES = 3
@@ -249,7 +251,7 @@ def chunk_by_headings(body: str, title: str) -> list[dict]:
     return chunks
 
 
-def chunk_note(note: dict, use_llm: bool, openrouter_key: str,
+def chunk_note(note: dict, use_llm: bool, api_key: str,
                verbose: bool = False) -> list[dict]:
     """Chunk a parsed note into atomic thoughts.
 
@@ -273,11 +275,11 @@ def chunk_note(note: dict, use_llm: bool, openrouter_key: str,
     # Process each chunk — LLM fallback for long sections
     results = []
     for chunk in chunks:
-        if word_count(chunk['content']) > LLM_CHUNK_THRESHOLD and use_llm and openrouter_key:
+        if word_count(chunk['content']) > LLM_CHUNK_THRESHOLD and use_llm and api_key:
             if verbose:
                 print(f"    LLM chunking section: {chunk['section']} "
                       f"({word_count(chunk['content'])} words)")
-            llm_thoughts = llm_distill(title, chunk['content'], openrouter_key)
+            llm_thoughts = llm_distill(title, chunk['content'], api_key)
             for thought in llm_thoughts:
                 results.append({
                     'content': thought,
@@ -305,22 +307,23 @@ def llm_distill(title: str, content: str, api_key: str) -> list[str]:
     for attempt in range(MAX_RETRIES):
         try:
             resp = requests.post(
-                "https://openrouter.ai/api/v1/chat/completions",
+                f"{GEMINI_API_BASE}/models/{LLM_MODEL}:generateContent",
                 headers={
-                    "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
+                    "x-goog-api-key": api_key,
                 },
                 json={
-                    "model": LLM_MODEL,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.3,
-                    "response_format": {"type": "json_object"},
+                    "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                    "generationConfig": {
+                        "responseMimeType": "application/json",
+                        "temperature": 0.3,
+                    },
                 },
                 timeout=30,
             )
             resp.raise_for_status()
             data = resp.json()
-            text = data["choices"][0]["message"]["content"]
+            text = data["candidates"][0]["content"]["parts"][0]["text"]
             parsed = json.loads(text)
             thoughts = parsed.get("thoughts", [])
             if thoughts and isinstance(thoughts, list):
@@ -344,20 +347,21 @@ def generate_embedding(text: str, api_key: str) -> list[float] | None:
     for attempt in range(MAX_RETRIES):
         try:
             resp = requests.post(
-                "https://openrouter.ai/api/v1/embeddings",
+                f"{GEMINI_API_BASE}/models/{EMBEDDING_MODEL}:embedContent",
                 headers={
-                    "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
+                    "x-goog-api-key": api_key,
                 },
                 json={
-                    "model": EMBEDDING_MODEL,
-                    "input": text[:8000],  # respect token limits
+                    "model": f"models/{EMBEDDING_MODEL}",
+                    "content": {"parts": [{"text": text[:EMBEDDING_MAX_CHARS]}]},
+                    "outputDimensionality": EMBEDDING_DIMS,
                 },
                 timeout=30,
             )
             resp.raise_for_status()
             data = resp.json()
-            return data["data"][0]["embedding"]
+            return data["embedding"]["values"]
         except (requests.RequestException, KeyError, IndexError) as e:
             status = getattr(getattr(e, 'response', None), 'status_code', None)
             if attempt < MAX_RETRIES - 1:
@@ -380,69 +384,62 @@ def generate_embedding(text: str, api_key: str) -> list[float] | None:
     return None
 
 
-# ── Supabase ─────────────────────────────────────────────────────────────────
+# ── PostgreSQL (self-hosted) ─────────────────────────────────────────────────
+
+import psycopg
+
+_conn = None
+
+
+def _get_conn():
+    """Lazy shared connection to the self-hosted OB1 Postgres."""
+    global _conn
+    if _conn is None or _conn.closed:
+        _conn = psycopg.connect(
+            host=os.environ.get("DB_HOST", "127.0.0.1"),
+            port=int(os.environ.get("DB_PORT", "5432")),
+            dbname=os.environ.get("DB_NAME", "openbrain"),
+            user=os.environ.get("DB_USER", "ob1"),
+            password=os.environ.get("DB_PASSWORD", ""),
+        )
+        _conn.autocommit = True
+    return _conn
+
 
 def insert_thought(content: str, embedding: list[float] | None, metadata: dict,
-                   supabase_url: str, supabase_key: str,
                    created_at: str | None = None,
                    fingerprint: str | None = None) -> str:
-    """Insert a thought into the Supabase thoughts table.
+    """Insert a thought into the self-hosted Postgres thoughts table.
 
     Returns 'inserted', 'duplicate', or 'failed'.
 
-    If fingerprint is provided and the thoughts table has a unique index on
-    content_fingerprint, duplicates are rejected with 409 Conflict.
+    Relies on the unique index on content_fingerprint: ON CONFLICT DO NOTHING
+    makes a duplicate insert a no-op (rowcount 0 -> 'duplicate').
     """
-    payload = {
-        "content": content,
-        "metadata": metadata,
-    }
-    if embedding:
-        payload["embedding"] = embedding
-    if created_at:
-        payload["created_at"] = created_at
-    if fingerprint:
-        payload["content_fingerprint"] = fingerprint
-
-    headers = {
-        "apikey": supabase_key,
-        "Authorization": f"Bearer {supabase_key}",
-        "Content-Type": "application/json",
-        "Prefer": "return=minimal",
-    }
-    # If fingerprint is set and the table has a unique index on content_fingerprint,
-    # this upsert skips duplicates. Without the index, it behaves as a normal insert.
-    if fingerprint:
-        headers["Prefer"] = "return=minimal,resolution=merge-duplicates"
-
-    for attempt in range(MAX_RETRIES):
+    try:
+        cur = _get_conn().cursor()
         try:
-            resp = requests.post(
-                f"{supabase_url}/rest/v1/thoughts",
-                headers=headers,
-                json=payload,
-                timeout=15,
+            cur.execute(
+                """INSERT INTO thoughts (content, embedding, metadata, content_fingerprint, created_at)
+                   VALUES (%s, %s::vector, %s::jsonb, %s, COALESCE(%s::timestamptz, now()))
+                   ON CONFLICT (content_fingerprint) WHERE content_fingerprint IS NOT NULL
+                   DO NOTHING""",
+                (
+                    content,
+                    f"[{','.join(map(str, embedding))}]" if embedding else None,
+                    json.dumps(metadata),
+                    fingerprint,
+                    created_at,
+                ),
             )
-            resp.raise_for_status()
-            return "inserted"
-        except requests.RequestException as e:
-            status = getattr(e.response, 'status_code', None) if hasattr(e, 'response') else None
-            if status == 409:
-                return "duplicate"
-            if attempt < MAX_RETRIES - 1 and status in (429, 500, 502, 503, 504):
-                wait = RETRY_BACKOFF * (2 ** attempt)
-                if status == 429:
-                    print(f"  Supabase rate limit hit. Retrying in {wait}s "
-                          f"(attempt {attempt + 1}/{MAX_RETRIES})", flush=True)
-                time.sleep(wait)
-                continue
-            if status == 429:
-                print(f"  Insert failed: Supabase rate limit exceeded after {MAX_RETRIES} retries. "
-                      f"Use --limit to reduce batch size.", flush=True)
-            else:
-                print(f"  Insert failed: {e}", flush=True)
-            return "failed"
-    return "failed"
+            if cur.rowcount == 1:
+                return "inserted"
+            return "duplicate"
+        finally:
+            cur.close()
+    except Exception as e:
+        print(f"  Insert failed: {e}", flush=True)
+        return "failed"
 
 
 # ── Sync Log ─────────────────────────────────────────────────────────────────
@@ -532,58 +529,48 @@ def main():
                 value = value.strip().strip('"').strip("'")
                 os.environ.setdefault(key.strip(), value)
 
-    supabase_url = os.environ.get("SUPABASE_URL", "")
-    supabase_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
-    openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
+    gemini_key = os.environ.get("GEMINI_API_KEY", "")
 
     if not args.dry_run:
-        if not supabase_url or not supabase_key:
-            print("Error: SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY required", file=sys.stderr)
+        if not os.environ.get("DB_HOST") or not os.environ.get("DB_PASSWORD"):
+            print("Error: DB_HOST and DB_PASSWORD required", file=sys.stderr)
             print("Set them in .env or as environment variables", file=sys.stderr)
             sys.exit(1)
-        if not openrouter_key and not args.no_embed:
-            print("Error: OPENROUTER_API_KEY required for embeddings", file=sys.stderr)
+        if not gemini_key and not args.no_embed:
+            print("Error: GEMINI_API_KEY required for embeddings", file=sys.stderr)
             print("Or use --no-embed to skip embedding generation", file=sys.stderr)
             sys.exit(1)
 
-    use_llm = not args.no_llm and bool(openrouter_key)
+    use_llm = not args.no_llm and bool(gemini_key)
 
     # ── Preflight: validate connections before any real work ──────────────────
 
     if not args.dry_run:
         print("Preflight check...", flush=True)
 
-        # Test Supabase: verify the thoughts table exists and is writable
+        # Test Postgres: verify the thoughts table exists and is reachable
         try:
-            resp = requests.get(
-                f"{supabase_url}/rest/v1/thoughts?limit=1",
-                headers={
-                    "apikey": supabase_key,
-                    "Authorization": f"Bearer {supabase_key}",
-                },
-                timeout=10,
-            )
-            if resp.status_code == 404:
-                print("Error: 'thoughts' table not found at this Supabase URL.", file=sys.stderr)
-                print(f"  URL: {supabase_url}/rest/v1/thoughts", file=sys.stderr)
-                print("  Check that the table exists and the URL is correct.", file=sys.stderr)
+            cur = _get_conn().cursor()
+            cur.execute("SELECT to_regclass('public.thoughts')")
+            table = cur.fetchone()[0]
+            cur.close()
+            if table is None:
+                print("Error: 'thoughts' table not found in the database.", file=sys.stderr)
                 sys.exit(1)
-            resp.raise_for_status()
-        except requests.RequestException as e:
-            print(f"Error: could not reach Supabase: {e}", file=sys.stderr)
-            print("  Check SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in .env", file=sys.stderr)
+        except Exception as e:
+            print(f"Error: could not reach Postgres: {e}", file=sys.stderr)
+            print("  Check DB_HOST / DB_PASSWORD in .env", file=sys.stderr)
             sys.exit(1)
 
-        # Test OpenRouter: verify the embedding endpoint works with a short string
+        # Test Gemini: verify the embedding endpoint works with a short string
         if not args.no_embed:
-            test_embedding = generate_embedding("preflight check", openrouter_key)
+            test_embedding = generate_embedding("preflight check", gemini_key)
             if not test_embedding:
                 print("Error: embedding preflight failed.", file=sys.stderr)
-                print("  Check OPENROUTER_API_KEY in .env and that your account has credit.",
-                      file=sys.stderr)
+                print("  Check GEMINI_API_KEY in .env", file=sys.stderr)
                 sys.exit(1)
 
-        print("  Supabase and OpenRouter connections verified.", flush=True)
+        print("  Postgres and Gemini connections verified.", flush=True)
         print()
 
     # Parse skip folders
@@ -708,7 +695,7 @@ def main():
     all_thoughts = []
 
     for i, note in enumerate(filtered):
-        chunks = chunk_note(note, use_llm, openrouter_key, verbose=args.verbose)
+        chunks = chunk_note(note, use_llm, gemini_key, verbose=args.verbose)
         note_date = extract_date(note['meta'], note['full_path'])
 
         for chunk in chunks:
@@ -807,19 +794,17 @@ def main():
         # Generate embedding (skip if --no-embed)
         embedding = None
         if not args.no_embed:
-            embedding = generate_embedding(thought['content'], openrouter_key)
+            embedding = generate_embedding(thought['content'], gemini_key)
             if not embedding:
                 embed_failures += 1
             else:
                 time.sleep(0.15)  # rate-limit between embedding calls
 
-        # Insert into Supabase (fingerprint enables DB-level dedup)
+        # Insert into self-hosted Postgres (fingerprint enables DB-level dedup)
         result = insert_thought(
             content=thought['content'],
             embedding=embedding,
             metadata=thought['metadata'],
-            supabase_url=supabase_url,
-            supabase_key=supabase_key,
             created_at=thought.get('created_at'),
             fingerprint=thought.get('fingerprint'),
         )
@@ -840,7 +825,7 @@ def main():
             if consecutive_failures >= 10:
                 print(f"\n  Aborting: {consecutive_failures} consecutive insert failures.",
                       file=sys.stderr, flush=True)
-                print("  Check your Supabase connection and try again.", file=sys.stderr)
+                print("  Check your Postgres connection and try again.", file=sys.stderr)
                 break
 
         # Progress
