@@ -7,12 +7,11 @@
  *
  * Environment variables:
  *   DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD - PostgreSQL connection
- *   EMBEDDING_API_BASE - Base URL for OpenAI-compatible embedding API
- *   EMBEDDING_API_KEY - API key for the embedding service
- *   EMBEDDING_MODEL - Model name for embeddings (default: text-embedding-3-small)
- *   CHAT_API_BASE - Base URL for OpenAI-compatible chat API (defaults to EMBEDDING_API_BASE)
- *   CHAT_API_KEY - API key for chat service (defaults to EMBEDDING_API_KEY)
- *   CHAT_MODEL - Model name for metadata extraction (default: gpt-4o-mini)
+ *   GEMINI_API_KEY - Google AI Studio API key (embeddings + metadata extraction)
+ *   GEMINI_API_BASE - Gemini REST base URL (default: https://generativelanguage.googleapis.com/v1beta)
+ *   EMBEDDING_MODEL - Embedding model (default: gemini-embedding-001)
+ *   EMBEDDING_DIMS - Embedding output dimensionality (default: 768; must match DB vector(768))
+ *   CHAT_MODEL - Model for metadata extraction (default: gemini-2.5-flash)
  *   MCP_ACCESS_KEY - Authentication key for MCP endpoint
  *   OPEN_BRAIN_CITATION_BASE_URL - Optional base URL for search/fetch citation links
  */
@@ -31,13 +30,12 @@ const DB_NAME = Deno.env.get("DB_NAME") || "openbrain";
 const DB_USER = Deno.env.get("DB_USER") || "postgres";
 const DB_PASSWORD = Deno.env.get("DB_PASSWORD")!;
 
-const EMBEDDING_API_BASE = Deno.env.get("EMBEDDING_API_BASE") || "https://openrouter.ai/api/v1";
-const EMBEDDING_API_KEY = Deno.env.get("EMBEDDING_API_KEY") || Deno.env.get("OPENROUTER_API_KEY") || "";
-const EMBEDDING_MODEL = Deno.env.get("EMBEDDING_MODEL") || "openai/text-embedding-3-small";
-
-const CHAT_API_BASE = Deno.env.get("CHAT_API_BASE") || EMBEDDING_API_BASE;
-const CHAT_API_KEY = Deno.env.get("CHAT_API_KEY") || EMBEDDING_API_KEY;
-const CHAT_MODEL = Deno.env.get("CHAT_MODEL") || "openai/gpt-4o-mini";
+const GEMINI_API_KEY = Deno.env.get("GEMINI_API_KEY") || Deno.env.get("GOOGLE_API_KEY") || "";
+const GEMINI_API_BASE =
+  Deno.env.get("GEMINI_API_BASE") || "https://generativelanguage.googleapis.com/v1beta";
+const EMBEDDING_MODEL = Deno.env.get("EMBEDDING_MODEL") || "gemini-embedding-001";
+const EMBEDDING_DIMS = parseInt(Deno.env.get("EMBEDDING_DIMS") || "768", 10);
+const CHAT_MODEL = Deno.env.get("CHAT_MODEL") || "gemini-2.5-flash";
 
 const MCP_ACCESS_KEY = Deno.env.get("MCP_ACCESS_KEY")!;
 
@@ -83,53 +81,70 @@ function thoughtUrl(id: string): string {
 // --- Embedding & Metadata Extraction ---
 
 async function getEmbedding(text: string): Promise<number[]> {
-  const r = await fetch(`${EMBEDDING_API_BASE}/embeddings`, {
+  // gemini-embedding-001 caps input at 2048 tokens; guard long captures.
+  const safeText = text.slice(0, 1800);
+  const r = await fetch(
+    `${GEMINI_API_BASE}/models/${EMBEDDING_MODEL}:embedContent`,
+    {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${EMBEDDING_API_KEY}`,
       "Content-Type": "application/json",
+      "x-goog-api-key": GEMINI_API_KEY,
     },
     body: JSON.stringify({
-      model: EMBEDDING_MODEL,
-      input: text,
+      model: `models/${EMBEDDING_MODEL}`,
+      content: { parts: [{ text: safeText }] },
+      outputDimensionality: EMBEDDING_DIMS,
     }),
-  });
+    }
+  );
   if (!r.ok) {
     const msg = await r.text().catch(() => "");
-    throw new Error(`Embedding API failed: ${r.status} ${msg}`);
+    throw new Error(`Gemini embedding failed: ${r.status} ${msg}`);
   }
   const d = await r.json();
-  return d.data[0].embedding;
+  return d.embedding.values as number[];
 }
 
 async function extractMetadata(text: string): Promise<Record<string, unknown>> {
-  const r = await fetch(`${CHAT_API_BASE}/chat/completions`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${CHAT_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: CHAT_MODEL,
-      response_format: { type: "json_object" },
-      messages: [
-        {
-          role: "system",
-          content: `Extract metadata from the user's captured thought. Return JSON with:
+  const systemPrompt = `Extract metadata from the user's captured thought. Return JSON with:
 - "people": array of people mentioned (empty if none)
 - "action_items": array of implied to-dos (empty if none)
 - "dates_mentioned": array of dates YYYY-MM-DD (empty if none)
 - "topics": array of 1-3 short topic tags (always at least one)
 - "type": one of "observation", "task", "idea", "reference", "person_note"
-Only extract what's explicitly there.`,
-        },
-        { role: "user", content: text },
+Only extract what's explicitly there.`;
+  const r = await fetch(
+    `${GEMINI_API_BASE}/models/${CHAT_MODEL}:generateContent`,
+    {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-goog-api-key": GEMINI_API_KEY,
+    },
+    body: JSON.stringify({
+      contents: [
+        { role: "user", parts: [{ text: `${systemPrompt}\n\nThought:\n${text}` }] },
       ],
+      generationConfig: {
+        responseMimeType: "application/json",
+        temperature: 0.3,
+      },
     }),
-  });
+    }
+  );
+  if (!r.ok) {
+    const msg = await r.text().catch(() => "");
+    throw new Error(`Gemini metadata extraction failed: ${r.status} ${msg}`);
+  }
   const d = await r.json();
   try {
-    return JSON.parse(d.choices[0].message.content);
+    const partText = d.candidates?.[0]?.content?.parts?.[0]?.text ?? "{}";
+    const parsed = JSON.parse(partText);
+    if (parsed && typeof parsed === "object") {
+      return parsed as Record<string, unknown>;
+    }
+    return { topics: ["uncategorized"], type: "observation" };
   } catch {
     return { topics: ["uncategorized"], type: "observation" };
   }
