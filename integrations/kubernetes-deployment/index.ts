@@ -594,6 +594,45 @@ const app = new Hono();
 
 app.options("*", (c) => c.text("ok", 200, corsHeaders));
 
+// --- Health check (plain JSON — NOT the MCP stream) ---
+// The streamable-HTTP transport below swallows every other GET into an SSE
+// session stream that never emits, so probes that GET /health hang until
+// timeout and report the service "offline". Answer real JSON here instead:
+// keyless by design (a health probe should work when the key store is the
+// thing that's broken) and backed by a live DB count.
+
+const STARTED_AT = Date.now();
+
+app.get("/health", async (c) => {
+  let thoughts = -1;
+  let db = "ok";
+  try {
+    const client = await pool.connect();
+    try {
+      const result = await client.queryObject<{ count: number }>(
+        "SELECT COUNT(*)::int AS count FROM thoughts"
+      );
+      thoughts = result.rows[0]?.count ?? 0;
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    db = (err as Error).message;
+  }
+  return c.json(
+    {
+      status: db === "ok" ? "ok" : "degraded",
+      service: "ob1-mcp",
+      thoughts,
+      db,
+      uptime_s: Math.round((Date.now() - STARTED_AT) / 1000),
+      time: new Date().toISOString(),
+    },
+    db === "ok" ? 200 : 503,
+    corsHeaders
+  );
+});
+
 app.all("*", async (c) => {
   const provided = c.req.header("x-brain-key") || new URL(c.req.url).searchParams.get("key");
   if (!provided || provided !== MCP_ACCESS_KEY) {
