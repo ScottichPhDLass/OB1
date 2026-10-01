@@ -810,6 +810,18 @@ def main():
     secrets_skipped = 0
     successful_paths = {}  # note_path → first insert timestamp
 
+    # ── Purge superseded chunks (source-stamped) BEFORE inserting ────────────
+    # ORDER IS LOAD-BEARING. insert_thought() dedups on content_fingerprint
+    # (ON CONFLICT DO NOTHING), and a chunk whose TEXT did not change in this
+    # revision therefore lands as a no-op "duplicate" that still carries the
+    # note's OLD note_hash. purge_superseded() deletes a note's rows whose
+    # note_hash != the current one — so running the purge AFTER the insert loop
+    # deleted exactly those unchanged chunks, and a changed note kept only the
+    # chunks whose text had actually changed (a 12-section note collapsed to 1
+    # row; reproduced 2026-10-01). Purging first clears the stale rows, so the
+    # insert loop lands the note's full new chunk set.
+    purged = purge_superseded(filtered)
+
     for i, thought in enumerate(all_thoughts):
         # Scan for secrets before embedding or inserting
         if not args.no_secret_scan:
@@ -886,8 +898,8 @@ def main():
         print(f"  Insert failures:    {insert_failures}")
 
     # ── Purge superseded chunks (source-stamped) ─────────────────────────────
+    # (already executed BEFORE the insert loop — see the note there)
 
-    purged = purge_superseded(filtered)
     print(f"  Superseded chunks purged: {purged}")
 
     # ── Update sync log ──────────────────────────────────────────────────────
