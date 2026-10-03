@@ -470,6 +470,31 @@ def purge_superseded(notes: list[dict]) -> int:
     return total
 
 
+def purge_one_note(note_path: str, note_hash: str) -> int:
+    """Delete ONE note's superseded rows. Returns the number deleted.
+
+    Per-note rather than per-run (2026-10-03): the purge for a note must finish
+    immediately before that note's chunks are inserted, so the window in which a
+    timeout can delete rows without replacing them shrinks from the whole
+    filtered set to a single note. End state is identical to the batched purge.
+    """
+    try:
+        cur = _get_conn().cursor()
+        try:
+            cur.execute(
+                "DELETE FROM thoughts "
+                "WHERE metadata->>'source_note' = %s "
+                "AND metadata->>'note_hash' != %s",
+                (note_path, note_hash),
+            )
+            return cur.rowcount
+        finally:
+            cur.close()
+    except Exception as e:
+        print(f"  Purge failed for {note_path}: {e}", flush=True)
+        return 0
+
+
 # ── Sync Log ─────────────────────────────────────────────────────────────────
 
 SYNC_LOG_FILE = "obsidian-sync-log.json"
@@ -820,9 +845,45 @@ def main():
     # chunks whose text had actually changed (a 12-section note collapsed to 1
     # row; reproduced 2026-10-01). Purging first clears the stale rows, so the
     # insert loop lands the note's full new chunk set.
-    purged = purge_superseded(filtered)
+    # ── Per-note purge + per-note CHECKPOINT (resumable under a kill) ─────────
+    # The batched purge plus the single end-of-run save_sync_log() made a killed
+    # pass lose ALL of its bookkeeping, so the next tick re-embedded the
+    # identical set and died at the identical wall — a livelock, not an
+    # incremental sync. Measured 2026-10-03: Argus_Seed hit ~163 s timeouts on
+    # three consecutive cron ticks while obsidian-sync-log.json's mtime stayed
+    # frozen at its last good save (10-01 12:12). Purging and checkpointing per
+    # note means each completed note is recorded before the next one starts, so
+    # progress survives a kill and successive ticks converge.
+    purged = 0
+    prev_path = None
+    prev_hash = None
+    note_chunk_counts = {}
+    for _t in all_thoughts:
+        note_chunk_counts[_t['note_path']] = note_chunk_counts.get(_t['note_path'], 0) + 1
 
     for i, thought in enumerate(all_thoughts):
+        note_path = thought['note_path']
+
+        # NOTE BOUNDARY — the previous note is finished: record it and save the
+        # log. Then purge THIS note's superseded rows BEFORE any of its chunks
+        # land. Order is load-bearing: a chunk whose TEXT did not change in this
+        # revision inserts as a no-op "duplicate" that still carries the note's
+        # OLD note_hash, and the purge deletes exactly those rows — so purging
+        # after the inserts would collapse a changed note to its changed chunks.
+        if note_path != prev_path:
+            if prev_path is not None and prev_path in successful_paths:
+                sync_log.setdefault("notes", {})[prev_path] = {
+                    "content_hash": prev_hash,
+                    "thoughts_created": note_chunk_counts.get(prev_path, 0),
+                    "imported_at": successful_paths[prev_path],
+                }
+                sync_log["vault_path"] = str(vault_root)
+                sync_log["last_run"] = datetime.now(tz=timezone.utc).isoformat()
+                save_sync_log(recipe_dir, sync_log)
+            purged += purge_one_note(note_path, thought['note_hash'])
+            prev_path = note_path
+            prev_hash = thought['note_hash']
+
         # Scan for secrets before embedding or inserting
         if not args.no_secret_scan:
             secret_match = scan_for_secrets(thought['content'])
